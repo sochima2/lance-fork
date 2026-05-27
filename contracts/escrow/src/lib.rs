@@ -2205,12 +2205,12 @@ mod test {
         cc.deposit(&1u64, &10000i128);
         cc.release_milestone(&1u64, &client);
 
-        let (stored_admin, stored_agent, registry) = cc.get_escrow_config().unwrap();
+        let (stored_admin, stored_agent, registry) = cc.get_escrow_config();
         assert_eq!(stored_admin, admin);
         assert_eq!(stored_agent, agent_judge);
         assert_eq!(registry, None);
 
-        assert_eq!(cc.get_remaining_balance(&1u64).unwrap(), 6000);
+        assert_eq!(cc.get_remaining_balance(&1u64), 6000);
     }
 
     #[test]
