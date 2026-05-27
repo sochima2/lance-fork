@@ -4,6 +4,7 @@ use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, Address, Bytes, BytesN, Env, IntoVal,
     Symbol, Vec,
 };
+pub use profile::BadgeLevel;
 
 mod profile;
 mod storage;
@@ -337,6 +338,7 @@ impl ReputationContract {
             }
         };
 
+        profile.refresh_badges();
         storage::write_profile(&env, &address, &profile);
         env.events().publish(
             ("reputation", "ScoreAdjusted"),
@@ -374,6 +376,7 @@ impl ReputationContract {
             }
         };
 
+        profile.refresh_badges();
         storage::write_profile(&env, &address, &profile);
         env.events().publish(
             ("reputation", "ScoreAdjusted"),
@@ -387,6 +390,16 @@ impl ReputationContract {
             },
         );
         Self::bump_instance_ttl(&env);
+    }
+
+    /// Return the current badge level for an address/role pair.
+    pub fn get_badge(env: Env, address: Address, role: Role) -> BadgeLevel {
+        Self::bump_instance_ttl(&env);
+        let profile = storage::read_profile_or_default(&env, &address);
+        match role {
+            Role::Client => profile.client_badge,
+            Role::Freelancer => profile.freelancer_badge,
+        }
     }
 
     pub fn get_score(env: Env, address: Address, role: Role) -> ReputationScore {
@@ -652,6 +665,72 @@ mod test {
         assert_eq!(freelancer_score.total_jobs, 1);
         assert_eq!(freelancer_score.total_points, 4);
         assert_eq!(freelancer_score.reviews, 1);
+    }
+
+    // ── Issue #402: badge minting ──
+
+    #[test]
+    fn test_badge_starts_at_bronze_for_default_score() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let addr = Address::generate(&env);
+        let cid = env.register_contract(None, ReputationContract);
+        let client = ReputationContractClient::new(&env, &cid);
+        client.initialize(&admin);
+
+        // Default score is 5000 → Bronze
+        let badge = client.get_badge(&addr, &Role::Freelancer);
+        assert_eq!(badge, BadgeLevel::Bronze);
+    }
+
+    #[test]
+    fn test_badge_upgrades_to_silver_at_6000() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let addr = Address::generate(&env);
+        let cid = env.register_contract(None, ReputationContract);
+        let client = ReputationContractClient::new(&env, &cid);
+        client.initialize(&admin);
+
+        // Raise score by 1000 → 5000+1000 = 6000 → Silver
+        client.update_score(&addr, &Role::Freelancer, &1000);
+        let badge = client.get_badge(&addr, &Role::Freelancer);
+        assert_eq!(badge, BadgeLevel::Silver);
+    }
+
+    #[test]
+    fn test_badge_upgrades_to_gold_at_8000() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let addr = Address::generate(&env);
+        let cid = env.register_contract(None, ReputationContract);
+        let client = ReputationContractClient::new(&env, &cid);
+        client.initialize(&admin);
+
+        client.update_score(&addr, &Role::Freelancer, &3000); // 5000+3000=8000
+        assert_eq!(client.get_badge(&addr, &Role::Freelancer), BadgeLevel::Gold);
+    }
+
+    #[test]
+    fn test_slash_downgrades_badge() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let addr = Address::generate(&env);
+        let cid = env.register_contract(None, ReputationContract);
+        let client = ReputationContractClient::new(&env, &cid);
+        client.initialize(&admin);
+
+        // Bring to Gold first, then slash twice to drop back to Bronze
+        client.update_score(&addr, &Role::Client, &3000); // 8000 → Gold
+        assert_eq!(client.get_badge(&addr, &Role::Client), BadgeLevel::Gold);
+        client.slash(&addr, &Role::Client, &soroban_sdk::Symbol::new(&env, "fraud")); // 6000 → Silver
+        assert_eq!(client.get_badge(&addr, &Role::Client), BadgeLevel::Silver);
+        client.slash(&addr, &Role::Client, &soroban_sdk::Symbol::new(&env, "fraud")); // 4000 → Bronze
+        assert_eq!(client.get_badge(&addr, &Role::Client), BadgeLevel::Bronze);
     }
 
     #[test]
