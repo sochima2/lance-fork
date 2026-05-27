@@ -1,6 +1,5 @@
 use axum::Router;
 use dotenvy::dotenv;
-use sqlx::postgres::PgPoolOptions;
 use std::net::SocketAddr;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -27,10 +26,7 @@ async fn main() -> anyhow::Result<()> {
 
     let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
 
-    let pool = PgPoolOptions::new()
-        .max_connections(10)
-        .connect(&database_url)
-        .await?;
+    let pool = db::connect_pool(&database_url, db::DbPoolConfig::from_env()).await?;
 
     sqlx::migrate!("./migrations").run(&pool).await?;
 

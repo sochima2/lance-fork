@@ -6,6 +6,7 @@ pub mod evidence;
 pub mod health;
 pub mod jobs;
 pub mod milestones;
+pub mod state;
 pub mod uploads;
 pub mod users;
 pub mod verdicts;
@@ -24,6 +25,7 @@ pub fn api_router() -> Router<AppState> {
                 .nest("/jobs", jobs::router())
                 .nest("/disputes", disputes::router())
                 .nest("/appeals", appeals::router())
+                .nest("/state", state::router())
                 .nest("/users", users::router())
                 .nest("/uploads", uploads::router()),
         )
