@@ -89,6 +89,7 @@ pub enum DataKey {
     JobRegistry,
     Locked,
     MultisigConfig(u64), // Per-job multisig configuration
+    UpgradeAdmin,
 }
 
 #[contracttype]
@@ -104,6 +105,14 @@ pub struct EscrowInitializedEvent {
 pub struct AgentJudgeUpdatedEvent {
     pub old_agent: Address,
     pub new_agent: Address,
+    pub updated_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct UpgradeAdminSetEvent {
+    pub old_admin: Option<Address>,
+    pub new_admin: Address,
     pub updated_at: u64,
 }
 
@@ -125,6 +134,9 @@ pub enum EscrowError {
     MultisigRequired = 13,
     InsufficientSignatures = 14,
     AlreadySigned = 15,
+    ArithmeticError = 16,
+    UpgradeAdminAlreadySet = 17,
+    UpgradeAdminNotSet = 18,
 }
 
 #[contracttype]
@@ -276,11 +288,17 @@ impl EscrowContract {
         Ok(())
     }
 
+    pub fn version(_env: Env) -> u32 {
+        1
+    }
+
     pub fn initialize(env: Env, admin: Address, agent_judge: Address) -> Result<(), EscrowError> {
         // Prevent double initialization
         if env.storage().instance().has(&DataKey::Admin) {
             return Err(EscrowError::AlreadyInitialized);
         }
+
+        admin.require_auth();
 
         // Basic validation: admin and agent_judge must be distinct
         if admin == agent_judge {
@@ -371,7 +389,78 @@ impl EscrowContract {
         Ok(())
     }
 
-    /// Upgrades the current contract WASM. Only callable by admin.
+    pub fn get_admin(env: Env) -> Result<Address, EscrowError> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(EscrowError::NotInitialized)
+    }
+
+    pub fn get_agent_judge(env: Env) -> Result<Address, EscrowError> {
+        env.storage()
+            .instance()
+            .get(&DataKey::AgentJudge)
+            .ok_or(EscrowError::NotInitialized)
+    }
+
+    pub fn get_job_registry(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::JobRegistry)
+    }
+
+    /// One-time initialization of the upgrade admin.
+    pub fn init_upgrade_admin(env: Env, admin: Address) -> Result<(), EscrowError> {
+        if env.storage().instance().has(&DataKey::UpgradeAdmin) {
+            return Err(EscrowError::UpgradeAdminAlreadySet);
+        }
+        admin.require_auth();
+        env.storage().instance().set(&DataKey::UpgradeAdmin, &admin);
+
+        env.events().publish(
+            ("escrow", "UpgradeAdminSet"),
+            UpgradeAdminSetEvent {
+                old_admin: None,
+                new_admin: admin,
+                updated_at: env.ledger().timestamp(),
+            },
+        );
+        Ok(())
+    }
+
+    /// Rotate the upgrade admin.
+    pub fn set_upgrade_admin(env: Env, caller: Address, new_admin: Address) -> Result<(), EscrowError> {
+        caller.require_auth();
+        let current_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::UpgradeAdmin)
+            .ok_or(EscrowError::UpgradeAdminNotSet)?;
+
+        if caller != current_admin {
+            return Err(EscrowError::Unauthorized);
+        }
+
+        env.storage().instance().set(&DataKey::UpgradeAdmin, &new_admin);
+
+        env.events().publish(
+            ("escrow", "UpgradeAdminSet"),
+            UpgradeAdminSetEvent {
+                old_admin: Some(current_admin),
+                new_admin,
+                updated_at: env.ledger().timestamp(),
+            },
+        );
+        Ok(())
+    }
+
+    /// Returns the current upgrade admin address.
+    pub fn get_upgrade_admin(env: Env) -> Result<Address, EscrowError> {
+        env.storage()
+            .instance()
+            .get(&DataKey::UpgradeAdmin)
+            .ok_or(EscrowError::UpgradeAdminNotSet)
+    }
+
+    /// Upgrades the current contract WASM. Only callable by upgrade admin.
     pub fn upgrade(
         env: Env,
         caller: Address,
@@ -380,13 +469,13 @@ impl EscrowContract {
         Self::bump_instance_ttl(&env);
         caller.require_auth();
 
-        let admin: Address = env
+        let upgrade_admin: Address = env
             .storage()
             .instance()
-            .get(&DataKey::Admin)
-            .ok_or(EscrowError::NotInitialized)?;
+            .get(&DataKey::UpgradeAdmin)
+            .ok_or(EscrowError::UpgradeAdminNotSet)?;
 
-        if caller != admin {
+        if caller != upgrade_admin {
             return Err(EscrowError::UpgradeUnauthorized);
         }
 
@@ -412,14 +501,21 @@ impl EscrowContract {
         client: Address,
         freelancer: Address,
         token_addr: Address,
-    ) {
+    ) -> Result<(), EscrowError> {
         client.require_auth();
         let key = DataKey::Job(job_id);
         if env.storage().persistent().has(&key) {
-            panic!("job already exists");
+            return Err(EscrowError::InvalidInput);
         }
         let now: u64 = env.ledger().timestamp();
-        let expires_at = now + 30 * 24 * 60 * 60;
+        let expires_duration = 30u64
+            .checked_mul(24)
+            .and_then(|h| h.checked_mul(60))
+            .and_then(|m| m.checked_mul(60))
+            .ok_or(EscrowError::ArithmeticError)?;
+        let expires_at = now
+            .checked_add(expires_duration)
+            .ok_or(EscrowError::ArithmeticError)?;
 
         let job = EscrowJob {
             client: client.clone(),
@@ -442,16 +538,25 @@ impl EscrowContract {
         );
         env.storage().persistent().set(&key, &job);
         Self::bump_job_ttl(&env, &key);
+        Ok(())
     }
 
     /// Add a milestone to the job (setup phase only).
-    pub fn add_milestone(env: Env, job_id: u64, amount: i128) {
+    pub fn add_milestone(env: Env, job_id: u64, amount: i128) -> Result<(), EscrowError> {
         let key = DataKey::Job(job_id);
-        let mut job: EscrowJob = env.storage().persistent().get(&key).expect("job not found");
+        let mut job: EscrowJob = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(EscrowError::JobNotFound)?;
         Self::bump_job_ttl(&env, &key);
         job.client.require_auth();
-        assert!(job.status == EscrowStatus::Setup, "not in setup phase");
-        assert!(amount > 0, "amount must be > 0");
+        if job.status != EscrowStatus::Setup {
+            return Err(EscrowError::InvalidState);
+        }
+        if amount <= 0 {
+            return Err(EscrowError::InvalidInput);
+        }
 
         job.milestones.push_back(Milestone {
             amount,
@@ -460,6 +565,7 @@ impl EscrowContract {
         log!(&env, "add_milestone: job {} amount {}", job_id, amount);
         env.storage().persistent().set(&key, &job);
         Self::bump_job_ttl(&env, &key);
+        Ok(())
     }
 
     /// Client deposits total amount and transitions job to Funded.
@@ -490,7 +596,9 @@ impl EscrowContract {
 
         let mut total_milestones_amount = 0i128;
         for m in job.milestones.iter() {
-            total_milestones_amount = total_milestones_amount.saturating_add(m.amount);
+            total_milestones_amount = total_milestones_amount
+                .checked_add(m.amount)
+                .ok_or(EscrowError::ArithmeticError)?;
         }
 
         if total_milestones_amount != amount {
@@ -563,7 +671,10 @@ impl EscrowContract {
         milestone.status = MilestoneStatus::Released;
         job.milestones.set(idx, milestone.clone());
 
-        job.released_amount = job.released_amount.saturating_add(milestone.amount);
+        job.released_amount = job
+            .released_amount
+            .checked_add(milestone.amount)
+            .ok_or(EscrowError::ArithmeticError)?;
 
         let next_status = if job.released_amount == job.total_amount {
             EscrowStatus::Completed
@@ -604,44 +715,50 @@ impl EscrowContract {
 
     /// Happy-path release for an explicit milestone index (0-based).
     /// Only the client may call this to release the funds for a specific milestone.
-    pub fn release_funds(env: Env, job_id: u64, caller: Address, milestone_index: u32) {
+    pub fn release_funds(
+        env: Env,
+        job_id: u64,
+        caller: Address,
+        milestone_index: u32,
+    ) -> Result<(), EscrowError> {
         caller.require_auth();
 
         let key = DataKey::Job(job_id);
-        let mut job: EscrowJob = env.storage().persistent().get(&key).expect("job not found");
+        let mut job: EscrowJob = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(EscrowError::JobNotFound)?;
         Self::bump_job_ttl(&env, &key);
 
-        assert!(
-            job.status == EscrowStatus::Funded || job.status == EscrowStatus::WorkInProgress,
-            "job not in releaseable state"
-        );
-        assert!(caller == job.client, "only client can release");
-        assert!(
-            milestone_index < job.milestones.len(),
-            "invalid milestone index"
-        );
+        if !(job.status == EscrowStatus::Funded || job.status == EscrowStatus::WorkInProgress) {
+            return Err(EscrowError::InvalidState);
+        }
+        if caller != job.client {
+            return Err(EscrowError::Unauthorized);
+        }
+        if milestone_index >= job.milestones.len() {
+            return Err(EscrowError::InvalidInput);
+        }
 
-        let mut milestone = job
-            .milestones
-            .get(milestone_index)
-            .expect("invalid milestone");
-        assert!(
-            milestone.status == MilestoneStatus::Pending,
-            "milestone already released"
-        );
+        let mut milestone = job.milestones.get(milestone_index).unwrap();
+        if milestone.status != MilestoneStatus::Pending {
+            return Err(EscrowError::InvalidState);
+        }
 
         milestone.status = MilestoneStatus::Released;
         job.milestones.set(milestone_index, milestone.clone());
 
-        job.released_amount += milestone.amount;
+        job.released_amount = job
+            .released_amount
+            .checked_add(milestone.amount)
+            .ok_or(EscrowError::ArithmeticError)?;
         let next_status = if job.released_amount == job.total_amount {
             EscrowStatus::Completed
         } else {
             EscrowStatus::WorkInProgress
         };
-        job.status
-            .validate_transition(&next_status)
-            .expect("invalid state transition");
+        job.status.validate_transition(&next_status)?;
         job.status = next_status;
 
         enter_reentrancy_guard(&env);
@@ -663,6 +780,7 @@ impl EscrowContract {
         Self::bump_job_ttl(&env, &key);
 
         exit_reentrancy_guard(&env);
+        Ok(())
     }
 
     /// Either party opens a dispute, locking remaining funds.
@@ -709,34 +827,39 @@ impl EscrowContract {
         caller.require_auth();
 
         let key = DataKey::Job(job_id);
-        let mut job: EscrowJob = env.storage().persistent().get(&key).expect("job not found");
+        let mut job: EscrowJob = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(EscrowError::JobNotFound)?;
         Self::bump_job_ttl(&env, &key);
 
         // 2. Only client or freelancer may raise a dispute
-        assert!(
-            caller == job.client || caller == job.freelancer,
-            "unauthorized: only client or freelancer can raise a dispute"
-        );
+        if !(caller == job.client || caller == job.freelancer) {
+            return Err(EscrowError::Unauthorized);
+        }
 
         // 3. Job must still be active
-        assert!(
-            job.status == EscrowStatus::Funded || job.status == EscrowStatus::WorkInProgress,
-            "dispute cannot be raised: job is not in active state"
-        );
+        if !(job.status == EscrowStatus::Funded || job.status == EscrowStatus::WorkInProgress) {
+            return Err(EscrowError::InvalidState);
+        }
 
         // 4. Prevent dispute if all funds are already released
-        assert!(
-            job.released_amount < job.total_amount,
-            "dispute cannot be raised: all funds already released"
-        );
+        if job.released_amount >= job.total_amount {
+            return Err(EscrowError::InvalidState);
+        }
 
         // 5. Prevent dispute if deadline has drastically expired (7-day grace period)
         let now: u64 = env.ledger().timestamp();
-        let grace_period: u64 = 7 * 24 * 60 * 60;
-        assert!(
-            now <= job.expires_at + grace_period,
-            "dispute cannot be raised: deadline has drastically expired"
-        );
+        let grace_period: u64 = 7u64
+            .checked_mul(24)
+            .and_then(|h| h.checked_mul(60))
+            .and_then(|m| m.checked_mul(60))
+            .ok_or(EscrowError::ArithmeticError)?;
+        let expiration_threshold = job.expires_at.checked_add(grace_period).ok_or(EscrowError::ArithmeticError)?;
+        if now > expiration_threshold {
+            return Err(EscrowError::InvalidState);
+        }
 
         // 6. Lock funds by transitioning to Disputed — blocks release_funds & release_milestone
         let next_status = EscrowStatus::Disputed;
@@ -773,32 +896,52 @@ impl EscrowContract {
     /// Agent Judge resolves dispute -- splits funds by explicit amounts.
     /// `payee_amount`: Amount to pay to the freelancer (payee).
     /// `payer_amount`: Amount to return to the client (payer).
-    pub fn resolve_dispute(env: Env, job_id: u64, payee_amount: i128, payer_amount: i128) {
+    pub fn resolve_dispute(
+        env: Env,
+        job_id: u64,
+        payee_amount: i128,
+        payer_amount: i128,
+    ) -> Result<(), EscrowError> {
         Self::bump_instance_ttl(&env);
         let agent_judge: Address = env
             .storage()
             .instance()
             .get(&DataKey::AgentJudge)
-            .expect("agent judge not set");
+            .ok_or(EscrowError::NotInitialized)?;
         agent_judge.require_auth();
 
-        assert!(payee_amount >= 0, "payee_amount must be >= 0");
-        assert!(payer_amount >= 0, "payer_amount must be >= 0");
+        if payee_amount < 0 || payer_amount < 0 {
+            return Err(EscrowError::InvalidInput);
+        }
 
         let key = DataKey::Job(job_id);
-        let mut job: EscrowJob = env.storage().persistent().get(&key).expect("job not found");
+        let mut job: EscrowJob = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(EscrowError::JobNotFound)?;
         Self::bump_job_ttl(&env, &key);
-        assert!(job.status == EscrowStatus::Disputed, "job not disputed");
+        if job.status != EscrowStatus::Disputed {
+            return Err(EscrowError::InvalidState);
+        }
 
-        let remaining = job.total_amount - job.released_amount;
-        let total_payout = payee_amount + payer_amount;
-        assert!(total_payout <= remaining, "payout exceeds remaining funds");
+        let remaining = job
+            .total_amount
+            .checked_sub(job.released_amount)
+            .ok_or(EscrowError::ArithmeticError)?;
+        let total_payout = payee_amount
+            .checked_add(payer_amount)
+            .ok_or(EscrowError::ArithmeticError)?;
+        if total_payout > remaining {
+            return Err(EscrowError::AmountMismatch);
+        }
 
         let next_status = EscrowStatus::Resolved;
-        job.status
-            .validate_transition(&next_status)
-            .expect("invalid state transition");
-        job.released_amount += total_payout;
+        job.status.validate_transition(&next_status)?;
+        job.released_amount = job
+            .released_amount
+            .checked_add(total_payout)
+            .ok_or(EscrowError::ArithmeticError)?;
         job.status = next_status;
 
         enter_reentrancy_guard(&env);
@@ -826,6 +969,7 @@ impl EscrowContract {
         Self::bump_job_ttl(&env, &key);
 
         exit_reentrancy_guard(&env);
+        Ok(())
     }
 
     /// Client recoups funds if freelancer never responded or deadline has passed.
@@ -848,7 +992,10 @@ impl EscrowContract {
             return Err(EscrowError::Unauthorized);
         }
 
-        let remaining = job.total_amount - job.released_amount;
+        let remaining = job
+            .total_amount
+            .checked_sub(job.released_amount)
+            .ok_or(EscrowError::ArithmeticError)?;
 
         let next_status = EscrowStatus::Refunded;
         job.status.validate_transition(&next_status)?;
@@ -876,23 +1023,51 @@ impl EscrowContract {
         Ok(())
     }
 
-    pub fn get_job(env: Env, job_id: u64) -> EscrowJob {
+    pub fn get_job(env: Env, job_id: u64) -> Result<EscrowJob, EscrowError> {
         let key = DataKey::Job(job_id);
-        let job: EscrowJob = env.storage().persistent().get(&key).expect("job not found");
+        let job: EscrowJob = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(EscrowError::JobNotFound)?;
         Self::bump_job_ttl(&env, &key);
-        job
+        Ok(job)
+    }
+
+    /// Returns the current balance of an escrow (total - released).
+    pub fn get_escrow_balance(env: Env, job_id: u64) -> Result<i128, EscrowError> {
+        let job = Self::get_job(env, job_id)?;
+        job.total_amount
+            .checked_sub(job.released_amount)
+            .ok_or(EscrowError::ArithmeticError)
     }
 
     /// Retrieve the status of all milestones for a given job.
-    pub fn get_milestone_status(env: Env, job_id: u64) -> Vec<MilestoneStatus> {
+    pub fn get_milestone_status(env: Env, job_id: u64) -> Result<Vec<MilestoneStatus>, EscrowError> {
         let key = DataKey::Job(job_id);
-        let job: EscrowJob = env.storage().persistent().get(&key).expect("job not found");
+        let job: EscrowJob = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(EscrowError::JobNotFound)?;
         Self::bump_job_ttl(&env, &key);
         let mut statuses = Vec::new(&env);
         for m in job.milestones.iter() {
             statuses.push_back(m.status);
         }
-        statuses
+        Ok(statuses)
+    }
+
+    /// Retrieve the multisig configuration for a given job.
+    pub fn get_multisig_config(env: Env, job_id: u64) -> Result<MultisigConfig, EscrowError> {
+        let config_key = DataKey::MultisigConfig(job_id);
+        let config: MultisigConfig = env
+            .storage()
+            .persistent()
+            .get(&config_key)
+            .ok_or(EscrowError::InvalidInput)?;
+        Self::bump_job_ttl(&env, &config_key);
+        Ok(config)
     }
 
     /// Configure multisig for a job. Only callable by client during Setup phase.
@@ -2162,5 +2337,42 @@ mod test {
         assert_eq!(job.status, EscrowStatus::Disputed);
         assert_eq!(job.total_amount, 5000);
         assert_eq!(job.released_amount, 0);
+    }
+
+    #[test]
+    fn test_version() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, EscrowContract);
+        let cc = EscrowContractClient::new(&env, &contract_id);
+        assert_eq!(cc.version(), 1);
+    }
+
+    #[test]
+    fn test_get_multisig_config() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let agent_judge = Address::generate(&env);
+        let client = Address::generate(&env);
+        let freelancer = Address::generate(&env);
+        let signer1 = Address::generate(&env);
+        let signer2 = Address::generate(&env);
+
+        let token_addr = setup_token(&env, &admin);
+        mint(&env, &token_addr, &client);
+
+        let contract_id = env.register_contract(None, EscrowContract);
+        let cc = EscrowContractClient::new(&env, &contract_id);
+
+        cc.initialize(&admin, &agent_judge);
+        cc.create_job(&1u64, &client, &freelancer, &token_addr);
+
+        let signers = soroban_sdk::vec![&env, signer1.clone(), signer2.clone()];
+        cc.configure_multisig(&1u64, &signers, &2u32);
+
+        let config = cc.get_multisig_config(&1u64);
+        assert_eq!(config.required_signatures, 2);
+        assert_eq!(config.signers.len(), 2);
     }
 }
