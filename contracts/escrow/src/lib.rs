@@ -83,6 +83,7 @@ pub struct EscrowJob {
     pub requires_multisig: bool,
     pub token_decimals: u32, // populated during deposit via token::Client::decimals()
     pub dispute_deadline: u64, // 0 = no active dispute; set when dispute is raised/opened
+    pub funded_ledger_seq: u32, // ledger sequence at funding time; used for flash-loan resistance
 }
 
 /// Packs admin and agent_judge under one instance storage entry to cut ledger footprint.
@@ -348,19 +349,40 @@ impl EscrowContract {
         }
     }
 
-    fn checked_add_i128(env: &Env, a: i128, b: i128) -> Result<i128, EscrowError> {
-        a.checked_add(b).ok_or_else(|| {
-            log!(env, "checked_add_i128 overflow: {} + {}", a, b);
-            EscrowError::InvalidInput
-        })
+fn assert_not_same_ledger_as_funding(
+    env: &Env,
+    job: &EscrowJob,
+) -> Result<(), EscrowError> {
+    if job.funded_ledger_seq != 0
+        && env.ledger().sequence() <= job.funded_ledger_seq
+    {
+        return Err(EscrowError::InvalidState);
     }
 
-    fn checked_sub_i128(env: &Env, a: i128, b: i128) -> Result<i128, EscrowError> {
-        a.checked_sub(b).ok_or_else(|| {
-            log!(env, "checked_sub_i128 underflow: {} - {}", a, b);
-            EscrowError::InvalidInput
-        })
-    }
+    Ok(())
+}
+
+fn checked_add_i128(
+    env: &Env,
+    a: i128,
+    b: i128,
+) -> Result<i128, EscrowError> {
+    a.checked_add(b).ok_or_else(|| {
+        log!(env, "checked_add_i128 overflow: {} + {}", a, b);
+        EscrowError::InvalidInput
+    })
+}
+
+fn checked_sub_i128(
+    env: &Env,
+    a: i128,
+    b: i128,
+) -> Result<i128, EscrowError> {
+    a.checked_sub(b).ok_or_else(|| {
+        log!(env, "checked_sub_i128 underflow: {} - {}", a, b);
+        EscrowError::InvalidInput
+    })
+}
 
     fn sync_dispute_to_job_registry(env: &Env, job_id: u64) -> Result<(), EscrowError> {
         Self::bump_instance_ttl(env);
@@ -406,6 +428,8 @@ impl EscrowContract {
         if admin == agent_judge {
             return Err(EscrowError::InvalidInput);
         }
+
+        admin.require_auth();
 
         env.storage().instance().set(
             &DataKey::Config,
@@ -605,17 +629,15 @@ impl EscrowContract {
             return Err(EscrowError::InvalidInput);
         }
         let now: u64 = env.ledger().timestamp();
-        let expires_at = now
-            .checked_add(30 * 24 * 60 * 60)
-            .expect("job expiration overflow");
-        let expires_duration = 30u64
-            .checked_mul(24)
-            .and_then(|h| h.checked_mul(60))
-            .and_then(|m| m.checked_mul(60))
-            .ok_or(EscrowError::ArithmeticError)?;
-        let expires_at = now
-            .checked_add(expires_duration)
-            .ok_or(EscrowError::ArithmeticError)?;
+let expires_duration = 30u64
+    .checked_mul(24)
+    .and_then(|h| h.checked_mul(60))
+    .and_then(|m| m.checked_mul(60))
+    .ok_or(EscrowError::ArithmeticOverflow)?;
+
+let expires_at = now
+    .checked_add(expires_duration)
+    .ok_or(EscrowError::ArithmeticOverflow)?;
 
         let job = EscrowJob {
             client: client.clone(),
@@ -630,6 +652,7 @@ impl EscrowContract {
             requires_multisig: false,
             token_decimals: 0,
             dispute_deadline: 0,
+            funded_ledger_seq: 0,
         };
         log!(
             &env,
@@ -725,6 +748,7 @@ impl EscrowContract {
         job.status.validate_transition(&next_status)?;
         job.total_amount = amount;
         job.status = next_status;
+        job.funded_ledger_seq = env.ledger().sequence();
 
         // Transfer tokens from client to contract
         let token_client = token::Client::new(&env, &job.token);
@@ -755,6 +779,8 @@ impl EscrowContract {
             .get(&key)
             .ok_or(EscrowError::JobNotFound)?;
         Self::bump_job_ttl(&env, &key);
+
+        Self::assert_not_same_ledger_as_funding(&env, &job)?;
 
         if !(job.status == EscrowStatus::Funded || job.status == EscrowStatus::WorkInProgress) {
             return Err(EscrowError::InvalidState);
@@ -830,15 +856,21 @@ impl EscrowContract {
             .ok_or(EscrowError::JobNotFound)?;
         Self::bump_job_ttl(&env, &key);
 
-        if !(job.status == EscrowStatus::Funded || job.status == EscrowStatus::WorkInProgress) {
-            return Err(EscrowError::InvalidState);
-        }
-        if caller != job.client {
-            return Err(EscrowError::Unauthorized);
-        }
-        if milestone_index >= job.milestones.len() {
-            return Err(EscrowError::InvalidInput);
-        }
+Self::assert_not_same_ledger_as_funding(&env, &job)?;
+
+if !(job.status == EscrowStatus::Funded
+    || job.status == EscrowStatus::WorkInProgress)
+{
+    return Err(EscrowError::InvalidState);
+}
+
+if caller != job.client {
+    return Err(EscrowError::Unauthorized);
+}
+
+if milestone_index >= job.milestones.len() {
+    return Err(EscrowError::InvalidInput);
+}
 
         let mut milestone = job.milestones.get(milestone_index).unwrap();
         if milestone.status != MilestoneStatus::Pending {
@@ -888,6 +920,8 @@ impl EscrowContract {
             .ok_or(EscrowError::JobNotFound)?;
         Self::bump_job_ttl(&env, &key);
 
+        Self::assert_not_same_ledger_as_funding(&env, &job)?;
+
         if !(job.status == EscrowStatus::Funded || job.status == EscrowStatus::WorkInProgress) {
             return Err(EscrowError::InvalidState);
         }
@@ -934,9 +968,13 @@ impl EscrowContract {
         }
 
         // 3. Job must still be active
-        if !(job.status == EscrowStatus::Funded || job.status == EscrowStatus::WorkInProgress) {
-            return Err(EscrowError::InvalidState);
-        }
+Self::assert_not_same_ledger_as_funding(&env, &job)?;
+
+if !(job.status == EscrowStatus::Funded
+    || job.status == EscrowStatus::WorkInProgress)
+{
+    return Err(EscrowError::InvalidState);
+}
 
         // 4. Prevent dispute if all funds are already released
         if job.released_amount >= job.total_amount {
@@ -1079,6 +1117,8 @@ impl EscrowContract {
             .ok_or(EscrowError::JobNotFound)?;
         Self::bump_job_ttl(&env, &key);
 
+        Self::assert_not_same_ledger_as_funding(&env, &job)?;
+
         if !(job.status == EscrowStatus::Funded || job.status == EscrowStatus::WorkInProgress) {
             return Err(EscrowError::InvalidState);
         }
@@ -1213,6 +1253,40 @@ impl EscrowContract {
         job.token_decimals
     }
 
+    /// Returns the minimum ledger separation enforced between funding and first state mutation.
+    pub fn get_funding_settlement_ledgers(_env: Env) -> u32 {
+        1
+    }
+
+    /// Returns remaining balance (total - released) for a job.
+    pub fn get_remaining_balance(env: Env, job_id: u64) -> Result<i128, EscrowError> {
+        let key = DataKey::Job(job_id);
+        let job: EscrowJob = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(EscrowError::JobNotFound)?;
+        Self::bump_job_ttl(&env, &key);
+        job.total_amount
+            .checked_sub(job.released_amount)
+            .ok_or(EscrowError::ArithmeticOverflow)
+    }
+
+    /// Returns escrow's core live parameters for a job: total, released, and funding ledger sequence.
+    pub fn get_active_escrow_params(
+        env: Env,
+        job_id: u64,
+    ) -> Result<(i128, i128, u32), EscrowError> {
+        let key = DataKey::Job(job_id);
+        let job: EscrowJob = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(EscrowError::JobNotFound)?;
+        Self::bump_job_ttl(&env, &key);
+        Ok((job.total_amount, job.released_amount, job.funded_ledger_seq))
+    }
+
     /// Returns the dispute resolution deadline (unix timestamp). 0 = no active dispute.
     pub fn get_dispute_deadline(env: Env, job_id: u64) -> u64 {
         let key = DataKey::Job(job_id);
@@ -1268,6 +1342,10 @@ impl EscrowContract {
             job_id,
             remaining
         );
+env.storage().persistent().set(&key, &job);
+Self::bump_job_ttl(&env, &key);
+
+exit_reentrancy_guard(&env);
         env.events().publish(
             ("escrow", "DisputeExpired"),
             DisputeExpiredEvent {
