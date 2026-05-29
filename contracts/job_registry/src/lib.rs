@@ -1,66 +1,40 @@
 #![no_std]
 
-use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, log, panic_with_error, symbol_short,
-    Address, Bytes, Env, Vec,
-};
-
-const MAX_HASH_LEN: u32 = 96;
-
-#[contracterror]
-#[derive(Clone, Copy, Debug, Eq, PartialEq, PartialOrd, Ord)]
-#[repr(u32)]
-pub enum JobRegistryError {
-    AlreadyInitialized = 1,
-    NotInitialized = 2,
-    InvalidJobId = 3,
-    InvalidBudget = 4,
-    InvalidHash = 5,
-    JobAlreadyExists = 6,
-    JobNotFound = 7,
-    JobNotOpen = 8,
-    Unauthorized = 9,
-    BidAlreadySubmitted = 10,
-    BidNotFound = 11,
-    InvalidStateTransition = 12,
-    NoDeliverable = 13,
-    Overflow = 14,
-}
+use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, String};
 
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
 pub enum JobStatus {
     Open,
-    InProgress,
-    DeliverableSubmitted,
-    Completed,
-    Disputed,
+    Assigned,
+    Closed,
 }
 
 #[contracttype]
-#[derive(Clone)]
-pub struct JobRecord {
-    pub client: Address,
-    pub freelancer: Option<Address>,
-    pub metadata_hash: Bytes,
-    pub budget_stroops: i128,
+#[derive(Clone, Debug, PartialEq)]
+pub struct Job {
+    pub owner: Address,
+    pub cid: String,
+    pub budget: i128,
     pub status: JobStatus,
+    pub bid_count: u32,
+    pub assigned_bidder: Option<Address>,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct Bid {
+    pub bidder: Address,
+    pub amount: i128,
+    pub submitted_at: u64,
 }
 
 #[contracttype]
 #[derive(Clone)]
-pub struct BidRecord {
-    pub freelancer: Address,
-    pub proposal_hash: Bytes,
-}
-
-#[contracttype]
 pub enum DataKey {
     Admin,
-    NextJobId,
     Job(u64),
-    Bids(u64),
-    Deliverable(u64),
+    Bid(u64, u32),
 }
 
 #[contract]
@@ -68,527 +42,315 @@ pub struct JobRegistryContract;
 
 #[contractimpl]
 impl JobRegistryContract {
-    /// One-time storage bootstrap.
-    ///
-    /// Sets contract admin and initializes `next_job_id` to 1.
     pub fn initialize(env: Env, admin: Address) {
-        if env.storage().instance().has(&DataKey::Admin) {
-            panic_with_error!(&env, JobRegistryError::AlreadyInitialized);
-        }
-
         admin.require_auth();
+
+        if env.storage().instance().has(&DataKey::Admin) {
+            panic!("already initialized");
+        }
+
         env.storage().instance().set(&DataKey::Admin, &admin);
-        env.storage().instance().set(&DataKey::NextJobId, &1u64);
-
-        log!(&env, "JobRegistry initialized with admin: {}", admin);
-        env.events().publish((symbol_short!("init"),), admin);
     }
 
-    /// Returns whether storage has been initialized.
-    pub fn is_initialized(env: Env) -> bool {
-        env.storage().instance().has(&DataKey::Admin)
-    }
+    pub fn post_job(env: Env, owner: Address, job_id: u64, cid: String, budget: i128) {
+        owner.require_auth();
 
-    pub fn get_admin(env: Env) -> Address {
-        read_admin(&env)
-    }
-
-    pub fn get_next_job_id(env: Env) -> u64 {
-        read_next_job_id(&env)
-    }
-
-    /// Client posts a job with explicit `job_id`.
-    /// `metadata_hash` is expected to contain CID bytes.
-    pub fn post_job(env: Env, job_id: u64, client: Address, hash: Bytes, budget: i128) {
-        ensure_initialized(&env);
-        validate_job_input(&env, job_id, &hash, budget);
-
-        client.require_auth();
-        post_job_with_id(&env, job_id, client.clone(), hash, budget);
-
-        // Keep auto-id monotonic when explicit ids are used.
-        let next_job_id = read_next_job_id(&env);
-        if job_id >= next_job_id {
-            let updated = job_id
-                .checked_add(1)
-                .unwrap_or_else(|| panic_with_error!(&env, JobRegistryError::Overflow));
-            env.storage().instance().set(&DataKey::NextJobId, &updated);
+        let checked_budget = budget.checked_mul(1).expect("overflow");
+        if checked_budget <= 0 {
+            panic!("budget must be positive");
         }
 
-        log!(
-            &env,
-            "post_job: id {} client {} budget {}",
-            job_id,
-            client,
-            budget
-        );
-        env.events()
-            .publish((symbol_short!("jobpost"), job_id), (client, budget));
+        let key = DataKey::Job(job_id);
+        if env.storage().persistent().has(&key) {
+            panic!("job already exists");
+        }
+
+        let job = Job {
+            owner,
+            cid,
+            budget,
+            status: JobStatus::Open,
+            bid_count: 0,
+            assigned_bidder: None,
+        };
+
+        env.storage().persistent().set(&key, &job);
     }
 
-    /// Client posts a job using internal registry index allocation.
-    pub fn post_job_auto(env: Env, client: Address, hash: Bytes, budget: i128) -> u64 {
-        ensure_initialized(&env);
+    pub fn submit_bid(env: Env, job_id: u64, bidder: Address, amount: i128) {
+        bidder.require_auth();
 
-        let job_id = read_next_job_id(&env);
-        validate_job_input(&env, job_id, &hash, budget);
-
-        client.require_auth();
-        post_job_with_id(&env, job_id, client.clone(), hash, budget);
-
-        let next = job_id
-            .checked_add(1)
-            .unwrap_or_else(|| panic_with_error!(&env, JobRegistryError::Overflow));
-        env.storage().instance().set(&DataKey::NextJobId, &next);
-
-        log!(
-            &env,
-            "post_job_auto: id {} client {} budget {}",
-            job_id,
-            client,
-            budget
-        );
-        env.events()
-            .publish((symbol_short!("jobauto"), job_id), (client, budget));
-
-        job_id
-    }
-
-    /// Freelancer submits a bid.
-    pub fn submit_bid(env: Env, job_id: u64, freelancer: Address, proposal_hash: Bytes) {
-        ensure_initialized(&env);
-        validate_hash(&env, &proposal_hash);
-        freelancer.require_auth();
+        let checked_amount = amount.checked_mul(1).expect("overflow");
+        if checked_amount <= 0 {
+            panic!("amount must be positive");
+        }
 
         let key = DataKey::Job(job_id);
-        let job: JobRecord = env
+        let mut job: Job = env
             .storage()
             .persistent()
             .get(&key)
-            .unwrap_or_else(|| panic_with_error!(&env, JobRegistryError::JobNotFound));
+            .expect("job not found");
 
         if job.status != JobStatus::Open {
-            panic_with_error!(&env, JobRegistryError::JobNotOpen);
+            panic!("job not open");
         }
 
-        let bids_key = DataKey::Bids(job_id);
-        let mut bids: Vec<BidRecord> = env
-            .storage()
-            .persistent()
-            .get(&bids_key)
-            .unwrap_or(Vec::new(&env));
+        let bid_index = job.bid_count;
+        let bid = Bid {
+            bidder,
+            amount,
+            submitted_at: env.ledger().timestamp(),
+        };
 
-        for bid in bids.iter() {
-            if bid.freelancer == freelancer {
-                panic_with_error!(&env, JobRegistryError::BidAlreadySubmitted);
-            }
-        }
-
-        bids.push_back(BidRecord {
-            freelancer: freelancer.clone(),
-            proposal_hash,
-        });
-        env.storage().persistent().set(&bids_key, &bids);
-
-        log!(&env, "submit_bid: id {} freelancer {}", job_id, freelancer);
-        env.events()
-            .publish((symbol_short!("bid"), job_id), freelancer);
-    }
-
-    /// Client accepts a bid, locking in the freelancer.
-    pub fn accept_bid(env: Env, job_id: u64, client: Address, freelancer: Address) {
-        ensure_initialized(&env);
-        client.require_auth();
-
-        let key = DataKey::Job(job_id);
-        let mut job: JobRecord = env
-            .storage()
-            .persistent()
-            .get(&key)
-            .unwrap_or_else(|| panic_with_error!(&env, JobRegistryError::JobNotFound));
-
-        if job.status != JobStatus::Open {
-            panic_with_error!(&env, JobRegistryError::JobNotOpen);
-        }
-        if client != job.client {
-            panic_with_error!(&env, JobRegistryError::Unauthorized);
-        }
-
-        let bids: Vec<BidRecord> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Bids(job_id))
-            .unwrap_or(Vec::new(&env));
-
-        let mut found = false;
-        for bid in bids.iter() {
-            if bid.freelancer == freelancer {
-                found = true;
-                break;
-            }
-        }
-        if !found {
-            panic_with_error!(&env, JobRegistryError::BidNotFound);
-        }
-
-        job.freelancer = Some(freelancer.clone());
-        job.status = JobStatus::InProgress;
-        env.storage().persistent().set(&key, &job);
-
-        log!(
-            &env,
-            "accept_bid: id {} client {} freelancer {}",
-            job_id,
-            client,
-            freelancer
-        );
-        env.events()
-            .publish((symbol_short!("accept"), job_id), freelancer);
-    }
-
-    /// Freelancer submits deliverable IPFS hash.
-    pub fn submit_deliverable(env: Env, job_id: u64, freelancer: Address, hash: Bytes) {
-        ensure_initialized(&env);
-        validate_hash(&env, &hash);
-        freelancer.require_auth();
-
-        let key = DataKey::Job(job_id);
-        let mut job: JobRecord = env
-            .storage()
-            .persistent()
-            .get(&key)
-            .unwrap_or_else(|| panic_with_error!(&env, JobRegistryError::JobNotFound));
-
-        if job.status != JobStatus::InProgress {
-            panic_with_error!(&env, JobRegistryError::InvalidStateTransition);
-        }
-        if job.freelancer != Some(freelancer.clone()) {
-            panic_with_error!(&env, JobRegistryError::Unauthorized);
-        }
-
-        job.status = JobStatus::DeliverableSubmitted;
-        env.storage().persistent().set(&key, &job);
         env.storage()
             .persistent()
-            .set(&DataKey::Deliverable(job_id), &hash);
+            .set(&DataKey::Bid(job_id, bid_index), &bid);
 
-        log!(
-            &env,
-            "submit_deliverable: id {} freelancer {}",
-            job_id,
-            freelancer
-        );
-        env.events()
-            .publish((symbol_short!("deliver"), job_id), freelancer);
+        job.bid_count = job.bid_count.checked_add(1).expect("overflow");
+        env.storage().persistent().set(&key, &job);
     }
 
-    /// Mark job disputed. Only the initialized admin can call this.
-    pub fn mark_disputed(env: Env, job_id: u64) {
-        ensure_initialized(&env);
-        let admin = read_admin(&env);
-        admin.require_auth();
+    pub fn accept_bid(env: Env, job_id: u64, caller: Address, bid_index: u32) {
+        caller.require_auth();
 
         let key = DataKey::Job(job_id);
-        let mut job: JobRecord = env
+        let mut job: Job = env
             .storage()
             .persistent()
             .get(&key)
-            .unwrap_or_else(|| panic_with_error!(&env, JobRegistryError::JobNotFound));
+            .expect("job not found");
 
-        if job.status != JobStatus::InProgress && job.status != JobStatus::DeliverableSubmitted {
-            panic_with_error!(&env, JobRegistryError::InvalidStateTransition);
+        if caller != job.owner {
+            panic!("unauthorized");
+        }
+        if job.status != JobStatus::Open {
+            panic!("job not open");
+        }
+        if bid_index >= job.bid_count {
+            panic!("invalid bid index");
         }
 
-        job.status = JobStatus::Disputed;
-        env.storage().persistent().set(&key, &job);
+        let bid: Bid = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Bid(job_id, bid_index))
+            .expect("bid not found");
 
-        log!(&env, "mark_disputed: id {}", job_id);
-        env.events().publish((symbol_short!("dispute"), job_id), ());
+        job.status = JobStatus::Assigned;
+        job.assigned_bidder = Some(bid.bidder);
+        env.storage().persistent().set(&key, &job);
     }
 
-    pub fn get_job(env: Env, job_id: u64) -> JobRecord {
-        ensure_initialized(&env);
+    pub fn close_job(env: Env, job_id: u64, caller: Address) {
+        caller.require_auth();
+
+        let key = DataKey::Job(job_id);
+        let mut job: Job = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .expect("job not found");
+
+        if caller != job.owner {
+            panic!("unauthorized");
+        }
+
+        job.status = JobStatus::Closed;
+        env.storage().persistent().set(&key, &job);
+    }
+
+    pub fn get_job(env: Env, job_id: u64) -> Job {
         env.storage()
             .persistent()
             .get(&DataKey::Job(job_id))
-            .unwrap_or_else(|| panic_with_error!(&env, JobRegistryError::JobNotFound))
+            .expect("job not found")
     }
 
-    pub fn get_bids(env: Env, job_id: u64) -> Vec<BidRecord> {
-        ensure_initialized(&env);
+    pub fn get_bid(env: Env, job_id: u64, bid_index: u32) -> Bid {
         env.storage()
             .persistent()
-            .get(&DataKey::Bids(job_id))
-            .unwrap_or(Vec::new(&env))
+            .get(&DataKey::Bid(job_id, bid_index))
+            .expect("bid not found")
     }
 
-    pub fn get_deliverable(env: Env, job_id: u64) -> Bytes {
-        ensure_initialized(&env);
-        env.storage()
-            .persistent()
-            .get(&DataKey::Deliverable(job_id))
-            .unwrap_or_else(|| panic_with_error!(&env, JobRegistryError::NoDeliverable))
+    pub fn get_job_status(env: Env, job_id: u64) -> JobStatus {
+        Self::get_job(env, job_id).status
     }
-}
-
-fn ensure_initialized(env: &Env) {
-    if !env.storage().instance().has(&DataKey::Admin) {
-        panic_with_error!(env, JobRegistryError::NotInitialized);
-    }
-}
-
-fn read_admin(env: &Env) -> Address {
-    ensure_initialized(env);
-    env.storage()
-        .instance()
-        .get(&DataKey::Admin)
-        .unwrap_or_else(|| panic_with_error!(env, JobRegistryError::NotInitialized))
-}
-
-fn read_next_job_id(env: &Env) -> u64 {
-    ensure_initialized(env);
-    env.storage()
-        .instance()
-        .get(&DataKey::NextJobId)
-        .unwrap_or_else(|| panic_with_error!(env, JobRegistryError::NotInitialized))
-}
-
-fn validate_job_input(env: &Env, job_id: u64, hash: &Bytes, budget: i128) {
-    if job_id == 0 {
-        panic_with_error!(env, JobRegistryError::InvalidJobId);
-    }
-    if budget <= 0 {
-        panic_with_error!(env, JobRegistryError::InvalidBudget);
-    }
-    validate_hash(env, hash);
-}
-
-fn validate_hash(env: &Env, hash: &Bytes) {
-    let len = hash.len();
-    if len == 0 || len > MAX_HASH_LEN {
-        panic_with_error!(env, JobRegistryError::InvalidHash);
-    }
-}
-
-fn post_job_with_id(env: &Env, job_id: u64, client: Address, hash: Bytes, budget: i128) {
-    let key = DataKey::Job(job_id);
-    if env.storage().persistent().has(&key) {
-        panic_with_error!(env, JobRegistryError::JobAlreadyExists);
-    }
-
-    let job = JobRecord {
-        client,
-        freelancer: None,
-        metadata_hash: hash,
-        budget_stroops: budget,
-        status: JobStatus::Open,
-    };
-    env.storage().persistent().set(&key, &job);
-
-    let bids: Vec<BidRecord> = Vec::new(env);
-    env.storage()
-        .persistent()
-        .set(&DataKey::Bids(job_id), &bids);
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
-    use soroban_sdk::testutils::Address as _;
-    use soroban_sdk::{Address, Bytes, Env};
+    use soroban_sdk::testutils::{Address as _, Ledger};
 
-    fn setup() -> (
-        Env,
-        JobRegistryContractClient<'static>,
-        Address,
-        Address,
-        Address,
-    ) {
+    fn setup_env() -> Env {
         let env = Env::default();
         env.mock_all_auths();
+        env.ledger().with_mut(|li| {
+            li.timestamp = 1_700_000_000;
+        });
+        env
+    }
 
-        let admin = Address::generate(&env);
-        let client = Address::generate(&env);
-        let freelancer = Address::generate(&env);
-
+    fn setup_client(env: &Env) -> JobRegistryContractClient<'_> {
         let contract_id = env.register_contract(None, JobRegistryContract);
-        let cc = JobRegistryContractClient::new(&env, &contract_id);
+        let client = JobRegistryContractClient::new(env, &contract_id);
+        let admin = Address::generate(env);
+        client.initialize(&admin);
+        client
+    }
 
-        (env, cc, admin, client, freelancer)
+    fn cid(env: &Env, value: &str) -> String {
+        String::from_str(env, value)
     }
 
     #[test]
-    fn test_initialize_bootstraps_storage() {
-        let (_env, cc, admin, _, _) = setup();
+    fn test_happy_path() {
+        let env = setup_env();
+        let client = setup_client(&env);
+        let owner = Address::generate(&env);
+        let bidder_1 = Address::generate(&env);
+        let bidder_2 = Address::generate(&env);
 
-        cc.initialize(&admin);
+        client.post_job(&owner, &1, &cid(&env, "bafy-job-1"), &1_000);
+        client.submit_bid(&1, &bidder_1, &800);
+        client.submit_bid(&1, &bidder_2, &700);
+        client.accept_bid(&1, &owner, &0);
 
-        assert!(cc.is_initialized());
-        assert_eq!(cc.get_admin(), admin);
-        assert_eq!(cc.get_next_job_id(), 1u64);
+        let job = client.get_job(&1);
+        assert_eq!(job.status, JobStatus::Assigned);
+        assert_eq!(job.assigned_bidder, Some(bidder_1));
+        assert_eq!(client.get_job_status(&1), JobStatus::Assigned);
     }
 
     #[test]
-    #[should_panic]
-    fn test_double_initialize_panics() {
-        let (_env, cc, admin, _, _) = setup();
+    #[should_panic(expected = "unauthorized")]
+    fn test_unauthorized_accept_bid() {
+        let env = setup_env();
+        let client = setup_client(&env);
+        let owner = Address::generate(&env);
+        let bidder = Address::generate(&env);
+        let caller = Address::generate(&env);
 
-        cc.initialize(&admin);
-        cc.initialize(&admin);
+        client.post_job(&owner, &1, &cid(&env, "bafy-job-1"), &1_000);
+        client.submit_bid(&1, &bidder, &800);
+        client.accept_bid(&1, &caller, &0);
     }
 
     #[test]
-    #[should_panic]
-    fn test_post_job_before_initialize_panics() {
-        let (env, cc, _admin, client, _) = setup();
-        let hash = Bytes::from_slice(&env, b"QmHash");
-        cc.post_job(&1u64, &client, &hash, &5000i128);
+    #[should_panic(expected = "job not open")]
+    fn test_submit_bid_on_assigned_job() {
+        let env = setup_env();
+        let client = setup_client(&env);
+        let owner = Address::generate(&env);
+        let bidder = Address::generate(&env);
+        let late_bidder = Address::generate(&env);
+
+        client.post_job(&owner, &1, &cid(&env, "bafy-job-1"), &1_000);
+        client.submit_bid(&1, &bidder, &800);
+        client.accept_bid(&1, &owner, &0);
+        client.submit_bid(&1, &late_bidder, &700);
     }
 
     #[test]
-    fn test_post_job_auto_allocates_sequential_ids() {
-        let (env, cc, admin, client, _) = setup();
-        cc.initialize(&admin);
+    #[should_panic(expected = "invalid bid index")]
+    fn test_invalid_bid_index() {
+        let env = setup_env();
+        let client = setup_client(&env);
+        let owner = Address::generate(&env);
+        let bidder = Address::generate(&env);
 
-        let hash1 = Bytes::from_slice(&env, b"QmHash1");
-        let hash2 = Bytes::from_slice(&env, b"QmHash2");
-
-        let id1 = cc.post_job_auto(&client, &hash1, &5000i128);
-        let id2 = cc.post_job_auto(&client, &hash2, &7000i128);
-
-        assert_eq!(id1, 1u64);
-        assert_eq!(id2, 2u64);
-        assert_eq!(cc.get_next_job_id(), 3u64);
+        client.post_job(&owner, &1, &cid(&env, "bafy-job-1"), &1_000);
+        client.submit_bid(&1, &bidder, &800);
+        client.accept_bid(&1, &owner, &1);
     }
 
     #[test]
-    fn test_post_job_with_explicit_id_updates_next_job_id() {
-        let (env, cc, admin, client, _) = setup();
-        cc.initialize(&admin);
+    #[should_panic(expected = "already initialized")]
+    fn test_double_initialize() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, JobRegistryContract);
+        let client = JobRegistryContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
 
-        let hash = Bytes::from_slice(&env, b"QmHash");
-        cc.post_job(&42u64, &client, &hash, &5000i128);
-
-        assert_eq!(cc.get_next_job_id(), 43u64);
+        client.initialize(&admin);
+        client.initialize(&admin);
     }
 
     #[test]
-    #[should_panic]
-    fn test_invalid_budget_panics() {
-        let (env, cc, admin, client, _) = setup();
-        cc.initialize(&admin);
+    #[should_panic(expected = "job already exists")]
+    fn test_duplicate_job_id() {
+        let env = setup_env();
+        let client = setup_client(&env);
+        let owner = Address::generate(&env);
 
-        let hash = Bytes::from_slice(&env, b"QmHash");
-        cc.post_job(&1u64, &client, &hash, &0i128);
+        client.post_job(&owner, &1, &cid(&env, "bafy-job-1"), &1_000);
+        client.post_job(&owner, &1, &cid(&env, "bafy-job-duplicate"), &2_000);
     }
 
     #[test]
-    #[should_panic]
-    fn test_empty_hash_panics() {
-        let (env, cc, admin, client, _) = setup();
-        cc.initialize(&admin);
+    #[should_panic(expected = "budget must be positive")]
+    fn test_negative_budget() {
+        let env = setup_env();
+        let client = setup_client(&env);
+        let owner = Address::generate(&env);
 
-        let empty = Bytes::from_slice(&env, b"");
-        cc.post_job(&1u64, &client, &empty, &5000i128);
+        client.post_job(&owner, &1, &cid(&env, "bafy-job-1"), &-1);
     }
 
     #[test]
-    fn test_full_lifecycle() {
-        let (env, cc, admin, client, freelancer) = setup();
-        cc.initialize(&admin);
+    fn test_close_job() {
+        let env = setup_env();
+        let client = setup_client(&env);
+        let owner = Address::generate(&env);
 
-        let hash = Bytes::from_slice(&env, b"QmSomeIPFSHash");
-        cc.post_job(&1u64, &client, &hash, &5000i128);
+        client.post_job(&owner, &1, &cid(&env, "bafy-job-1"), &1_000);
+        client.close_job(&1, &owner);
 
-        let job = cc.get_job(&1u64);
-        assert_eq!(job.status, JobStatus::Open);
-        assert_eq!(job.freelancer, None);
-
-        let proposal = Bytes::from_slice(&env, b"QmProposalHash");
-        cc.submit_bid(&1u64, &freelancer, &proposal);
-
-        let bids = cc.get_bids(&1u64);
-        assert_eq!(bids.len(), 1);
-
-        cc.accept_bid(&1u64, &client, &freelancer);
-        let job = cc.get_job(&1u64);
-        assert_eq!(job.status, JobStatus::InProgress);
-        assert_eq!(job.freelancer, Some(freelancer.clone()));
-
-        let deliverable = Bytes::from_slice(&env, b"QmDeliverableHash");
-        cc.submit_deliverable(&1u64, &freelancer, &deliverable);
-
-        let job = cc.get_job(&1u64);
-        assert_eq!(job.status, JobStatus::DeliverableSubmitted);
-
-        let d = cc.get_deliverable(&1u64);
-        assert_eq!(d, deliverable);
+        assert_eq!(client.get_job_status(&1), JobStatus::Closed);
     }
 
     #[test]
-    #[should_panic]
-    fn test_duplicate_bid_panics() {
-        let (env, cc, admin, client, freelancer) = setup();
-        cc.initialize(&admin);
+    fn test_multiple_jobs_isolated() {
+        let env = setup_env();
+        let client = setup_client(&env);
+        let owner_1 = Address::generate(&env);
+        let owner_2 = Address::generate(&env);
+        let bidder_1 = Address::generate(&env);
+        let bidder_2 = Address::generate(&env);
 
-        let hash = Bytes::from_slice(&env, b"QmHash");
-        cc.post_job(&1u64, &client, &hash, &5000i128);
+        client.post_job(&owner_1, &1, &cid(&env, "bafy-job-1"), &1_000);
+        client.post_job(&owner_2, &2, &cid(&env, "bafy-job-2"), &2_000);
+        client.submit_bid(&1, &bidder_1, &800);
+        client.submit_bid(&2, &bidder_2, &1_700);
+        client.accept_bid(&1, &owner_1, &0);
 
-        let proposal = Bytes::from_slice(&env, b"QmProposal");
-        cc.submit_bid(&1u64, &freelancer, &proposal);
-        cc.submit_bid(&1u64, &freelancer, &proposal);
+        let job_1 = client.get_job(&1);
+        let job_2 = client.get_job(&2);
+
+        assert_eq!(job_1.status, JobStatus::Assigned);
+        assert_eq!(job_1.assigned_bidder, Some(bidder_1));
+        assert_eq!(job_2.status, JobStatus::Open);
+        assert_eq!(job_2.assigned_bidder, None);
+        assert_eq!(job_1.bid_count, 1);
+        assert_eq!(job_2.bid_count, 1);
     }
 
     #[test]
-    #[should_panic]
-    fn test_accept_without_matching_bid_panics() {
-        let (env, cc, admin, client, freelancer) = setup();
-        cc.initialize(&admin);
+    fn test_get_bid() {
+        let env = setup_env();
+        let client = setup_client(&env);
+        let owner = Address::generate(&env);
+        let bidder = Address::generate(&env);
 
-        let hash = Bytes::from_slice(&env, b"QmHash");
-        cc.post_job(&1u64, &client, &hash, &5000i128);
+        client.post_job(&owner, &1, &cid(&env, "bafy-job-1"), &1_000);
+        client.submit_bid(&1, &bidder, &750);
 
-        cc.accept_bid(&1u64, &client, &freelancer);
-    }
-
-    #[test]
-    fn test_mark_disputed_from_in_progress() {
-        let (env, cc, admin, client, freelancer) = setup();
-        cc.initialize(&admin);
-
-        let hash = Bytes::from_slice(&env, b"QmHash");
-        cc.post_job(&1u64, &client, &hash, &5000i128);
-
-        let proposal = Bytes::from_slice(&env, b"QmProposal");
-        cc.submit_bid(&1u64, &freelancer, &proposal);
-        cc.accept_bid(&1u64, &client, &freelancer);
-
-        cc.mark_disputed(&1u64);
-        let job = cc.get_job(&1u64);
-        assert_eq!(job.status, JobStatus::Disputed);
-    }
-
-    #[test]
-    #[should_panic]
-    fn test_mark_disputed_from_open_panics() {
-        let (env, cc, admin, client, _) = setup();
-        cc.initialize(&admin);
-
-        let hash = Bytes::from_slice(&env, b"QmHash");
-        cc.post_job(&1u64, &client, &hash, &5000i128);
-
-        cc.mark_disputed(&1u64);
-    }
-
-    #[test]
-    #[should_panic]
-    fn test_get_deliverable_without_submission_panics() {
-        let (env, cc, admin, client, _) = setup();
-        cc.initialize(&admin);
-
-        let hash = Bytes::from_slice(&env, b"QmHash");
-        cc.post_job(&1u64, &client, &hash, &5000i128);
-
-        cc.get_deliverable(&1u64);
+        let bid = client.get_bid(&1, &0);
+        assert_eq!(bid.bidder, bidder);
+        assert_eq!(bid.amount, 750);
+        assert_eq!(bid.submitted_at, 1_700_000_000);
     }
 }
