@@ -1,134 +1,722 @@
+/**
+ * auth.ts — Secure JWT Session + Refresh Token Flow
+ */
+
 import { Router, Request, Response } from "express";
 import crypto from "crypto";
+import jwt, { SignOptions, JwtPayload } from "jsonwebtoken";
+import { z } from "zod";
+import { Keypair, StrKey } from "@stellar/stellar-sdk";
+
 import { prisma } from "../config/db";
-import { Keypair } from "@stellar/stellar-sdk";
+import { redis } from "../config/redis";
 
 const router = Router();
 
-// Define input types
-interface ChallengeRequest {
-  address: string;
-}
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
 
-interface VerifyRequest {
-  address: string;
-  signature: string;
-}
+const CHALLENGE_TTL_MS = 5 * 60 * 1000;
 
-// Scaffold the auth challenge route
-router.post("/challenge", async (req: Request<{}, {}, ChallengeRequest>, res: Response) => {
-  try {
-    const { address } = req.body;
+const ACCESS_TOKEN_TTL_SEC = 15 * 60;
+const REFRESH_TOKEN_TTL_SEC = 7 * 24 * 60 * 60;
 
-    if (!address) {
-      return res.status(400).json({ error: "Address is required" });
-    }
+const STELLAR_SIGN_PREFIX = "Stellar Signed Message:\n";
 
-    // Generate challenge matching the old Rust backend format
-    const nonce = crypto.randomUUID();
-    const challenge = `Lance wants you to sign in with your Stellar account:\n${address}\n\nNonce: ${nonce}`;
+const BLACKLIST_NS = "jwt:blacklist:";
 
-    // Expiration time: 5 minutes from now
-    const expiresAt = new Date(Date.now() + 5 * 60 * 1000);
+const ACCESS_TOKEN_COOKIE = "lance_access_token";
+const REFRESH_TOKEN_COOKIE = "lance_refresh_token";
 
-    // Save or update the challenge in the database
-    await prisma.auth_challenges.upsert({
-      where: { address },
-      update: { challenge, expires_at: expiresAt },
-      create: { address, challenge, expires_at: expiresAt },
-    });
+const isProduction = process.env.NODE_ENV === "production";
 
-    res.json({ challenge });
-  } catch (error) {
-    console.error("Auth challenge error:", error);
-    res.status(500).json({ error: "Internal server error" });
-  }
+const COOKIE_BASE_OPTIONS = {
+	httpOnly: true,
+	secure: isProduction,
+	sameSite: isProduction ? "strict" : "lax",
+	path: "/",
+} as const;
+
+// ---------------------------------------------------------------------------
+// Validation Schemas
+// ---------------------------------------------------------------------------
+
+const ChallengeRequestSchema = z.object({
+	address: z.string().min(1).max(128),
 });
 
-// Verify route
-router.post("/verify", async (req: Request<{}, {}, VerifyRequest>, res: Response) => {
-  try {
-    const { address, signature } = req.body;
-
-    if (!address || !signature) {
-      return res.status(400).json({ error: "Address and signature are required" });
-    }
-
-    // 1. Fetch the challenge
-    const record = await prisma.auth_challenges.findUnique({ where: { address } });
-    if (!record) {
-      return res.status(404).json({ error: "Challenge not found. Please request a new challenge." });
-    }
-
-    if (record.expires_at < new Date()) {
-      return res.status(400).json({ error: "Challenge expired" });
-    }
-
-    // 2. Verify the signature
-    let isValid = false;
-    try {
-      const keypair = Keypair.fromPublicKey(address);
-      
-      // Handle the case where signature is an object (some wallet kits wrap it)
-      const sigString = typeof signature === "object" && (signature as any).signature 
-        ? (signature as any).signature 
-        : typeof signature === "string" ? signature : "";
-
-      const hexRegex = /^[0-9a-fA-F]+$/;
-      const signatureBuffer = hexRegex.test(sigString) && sigString.length % 2 === 0
-        ? Buffer.from(sigString, "hex")
-        : Buffer.from(sigString, "base64");
-      
-      // Freighter (and stellar-wallets-kit) prefixes messages before hashing and signing to prevent spoofing
-      const SIGN_MESSAGE_PREFIX = "Stellar Signed Message:\n";
-      const payloadBuffer = Buffer.from(SIGN_MESSAGE_PREFIX + record.challenge);
-      const messageHash = crypto.createHash("sha256").update(payloadBuffer).digest();
-
-      isValid = keypair.verify(messageHash, signatureBuffer);
-      
-      // Fallback for mock wallet in E2E tests (it returns the literal string "mock-signature")
-      if (!isValid && process.env.NODE_ENV !== "production") {
-        if (signature === record.challenge || signature === "mock-signature") {
-          isValid = true;
-        }
-      }
-    } catch (err) {
-      console.error("Signature verification failed structurally:", err);
-      isValid = false;
-    }
-
-    // For local dev/E2E tests
-    if (!isValid && process.env.NODE_ENV !== "production") {
-      if (signature === record.challenge || signature === "mock-signature") {
-        isValid = true;
-      }
-    }
-
-    if (!isValid) {
-      return res.status(401).json({ error: "Invalid signature" });
-    }
-
-    // 3. Delete the used challenge
-    await prisma.auth_challenges.delete({ where: { address } });
-
-    // 4. Generate a session token
-    const token = crypto.randomUUID();
-    const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000); // 7 days
-
-    // 5. Save the session
-    await prisma.sessions.create({
-      data: {
-        token,
-        address,
-        expires_at: expiresAt,
-      },
-    });
-
-    res.json({ token, address });
-  } catch (error) {
-    console.error("Auth verify error:", error);
-    res.status(500).json({ error: "Internal server error" });
-  }
+const VerifyRequestSchema = z.object({
+	address: z.string().min(1).max(128),
+	signature: z.union([
+		z.string().min(1).max(1024),
+		z.object({
+			signature: z.string().min(1).max(1024),
+		}),
+	]),
 });
+
+const RefreshRequestSchema = z.object({
+	refresh_token: z.string().optional(),
+});
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+function sanitizeStellarAddress(rawAddress: unknown): string | null {
+	if (typeof rawAddress !== "string") {
+		return null;
+	}
+
+	const address = rawAddress.trim();
+
+	if (!/^G[A-Z2-7]{55}$/.test(address)) {
+		return null;
+	}
+
+	try {
+		const decoded = StrKey.decodeEd25519PublicKey(address);
+
+		if (
+			decoded.length !== 32 ||
+			!StrKey.isValidEd25519PublicKey(address)
+		) {
+			return null;
+		}
+
+		return StrKey.encodeEd25519PublicKey(decoded) === address
+			? address
+			: null;
+	} catch {
+		return null;
+	}
+}
+
+function buildMessageHash(challenge: string): Buffer {
+	const payload = Buffer.from(
+		STELLAR_SIGN_PREFIX + challenge,
+		"utf8"
+	);
+
+	return crypto.createHash("sha256").update(payload).digest();
+}
+
+function decodeSignature(raw: string): Buffer {
+	const trimmed = raw.trim();
+
+	const hexPattern = /^[0-9a-fA-F]+$/;
+
+	if (hexPattern.test(trimmed) && trimmed.length % 2 === 0) {
+		return Buffer.from(trimmed, "hex");
+	}
+
+	return Buffer.from(trimmed, "base64");
+}
+
+function timingSafeEqualStrings(a: string, b: string): boolean {
+	const aBuf = Buffer.from(a);
+	const bBuf = Buffer.from(b);
+
+	if (aBuf.length !== bBuf.length) {
+		return false;
+	}
+
+	return crypto.timingSafeEqual(aBuf, bBuf);
+}
+
+function issueAccessToken(address: string, jti: string): string {
+	const secret = process.env.JWT_SECRET;
+
+	if (!secret) {
+		throw new Error("JWT_SECRET environment variable is not set");
+	}
+
+	const options: SignOptions = {
+		subject: address,
+		jwtid: jti,
+		expiresIn: ACCESS_TOKEN_TTL_SEC,
+		issuer: "lance-marketplace",
+		audience: "lance-frontend",
+	};
+
+	return jwt.sign({ address }, secret, options);
+}
+
+async function issueRefreshToken(
+	address: string,
+	previousTokenId?: number
+): Promise<{ rawToken: string; hashedToken: string }> {
+	if (previousTokenId !== undefined) {
+		await prisma.refresh_tokens.update({
+			where: {
+				id: previousTokenId,
+			},
+			data: {
+				revoked: true,
+			},
+		});
+	}
+
+	const rawToken = crypto.randomBytes(48).toString("base64url");
+
+	const hashedToken = crypto
+		.createHash("sha256")
+		.update(rawToken)
+		.digest("hex");
+
+	const expiresAt = new Date(
+		Date.now() + REFRESH_TOKEN_TTL_SEC * 1000
+	);
+
+	await prisma.refresh_tokens.create({
+		data: {
+			token_hash: hashedToken,
+			address,
+			expires_at: expiresAt,
+			revoked: false,
+		},
+	});
+
+	return {
+		rawToken,
+		hashedToken,
+	};
+}
+
+async function blacklistToken(
+	jti: string,
+	expiresAt: number
+): Promise<void> {
+	const ttlSeconds = Math.max(
+		1,
+		expiresAt - Math.floor(Date.now() / 1000)
+	);
+
+	await redis.set(
+		`${BLACKLIST_NS}${jti}`,
+		"1",
+		"EX",
+		ttlSeconds,
+		"NX"
+	);
+}
+
+async function isTokenBlacklisted(
+	jti: string
+): Promise<boolean> {
+	const result = await redis.get(`${BLACKLIST_NS}${jti}`);
+
+	return result !== null;
+}
+
+// ---------------------------------------------------------------------------
+// Route: POST /challenge
+// ---------------------------------------------------------------------------
+
+interface ChallengeBody {
+	address: string;
+}
+
+router.post(
+	"/challenge",
+	async (
+		req: Request<{}, {}, ChallengeBody>,
+		res: Response
+	) => {
+		try {
+			const parsed =
+				ChallengeRequestSchema.safeParse(req.body);
+
+			if (!parsed.success) {
+				return res.status(400).json({
+					error: "Invalid request body",
+				});
+			}
+
+			const address = sanitizeStellarAddress(
+				parsed.data.address
+			);
+
+			if (!address) {
+				return res.status(400).json({
+					error: "Invalid Stellar address",
+				});
+			}
+
+			const nonce = crypto.randomUUID();
+
+			const issuedAt = new Date();
+
+			const expiresAt = new Date(
+				issuedAt.getTime() + CHALLENGE_TTL_MS
+			);
+
+			const challenge =
+				`Lance wants you to sign in with your Stellar account:\n` +
+				`${address}\n\n` +
+				`Nonce: ${nonce}\n` +
+				`Issued At: ${issuedAt.toISOString()}`;
+
+			await prisma.auth_challenges.upsert({
+				where: {
+					address,
+				},
+				update: {
+					challenge,
+					issued_at: issuedAt,
+					expires_at: expiresAt,
+				},
+				create: {
+					address,
+					challenge,
+					issued_at: issuedAt,
+					expires_at: expiresAt,
+				},
+			});
+
+			return res.status(200).json({
+				challenge,
+				expires_at: expiresAt.toISOString(),
+			});
+		} catch (error) {
+			console.error("[auth/challenge]", error);
+
+			return res.status(500).json({
+				error: "Internal server error",
+			});
+		}
+	}
+);
+
+// ---------------------------------------------------------------------------
+// Route: POST /verify
+// ---------------------------------------------------------------------------
+
+interface VerifyBody {
+	address: string;
+	signature: string | { signature: string };
+}
+
+router.post(
+	"/verify",
+	async (
+		req: Request<{}, {}, VerifyBody>,
+		res: Response
+	) => {
+		try {
+			const parsed =
+				VerifyRequestSchema.safeParse(req.body);
+
+			if (!parsed.success) {
+				return res.status(400).json({
+					error: "Invalid request body",
+				});
+			}
+
+			const address = sanitizeStellarAddress(
+				parsed.data.address
+			);
+
+			if (!address) {
+				return res.status(400).json({
+					error: "Invalid Stellar address",
+				});
+			}
+
+			let signature = parsed.data.signature;
+
+			if (
+				typeof signature === "object" &&
+				"signature" in signature
+			) {
+				signature = signature.signature;
+			}
+
+			const challengeRecord =
+				await prisma.auth_challenges.findUnique({
+					where: {
+						address,
+					},
+				});
+
+			if (!challengeRecord) {
+				return res.status(404).json({
+					error: "No challenge found",
+				});
+			}
+
+			if (
+				challengeRecord.expires_at.getTime() <=
+				Date.now()
+			) {
+				await prisma.auth_challenges
+					.delete({
+						where: {
+							address,
+						},
+					})
+					.catch(() => {});
+
+				return res.status(401).json({
+					error: "Challenge expired",
+				});
+			}
+
+			let isValid = false;
+
+			try {
+				const keypair =
+					Keypair.fromPublicKey(address);
+
+				const signatureBuffer =
+					decodeSignature(signature);
+
+				const messageHash = buildMessageHash(
+					challengeRecord.challenge
+				);
+
+				isValid = keypair.verify(
+					messageHash,
+					signatureBuffer
+				);
+			} catch (err) {
+				console.warn(
+					"[auth/verify] Signature verification failed:",
+					err
+				);
+
+				isValid = false;
+			}
+
+			if (
+				!isValid &&
+				process.env.NODE_ENV !== "production"
+			) {
+				if (
+					signature === "mock-signature" ||
+					timingSafeEqualStrings(
+						signature,
+						challengeRecord.challenge
+					)
+				) {
+					isValid = true;
+				}
+			}
+
+			if (!isValid) {
+				return res.status(401).json({
+					error: "Invalid signature",
+				});
+			}
+
+			await prisma.auth_challenges.delete({
+				where: {
+					address,
+				},
+			});
+
+			const accessJti = crypto.randomUUID();
+
+			const accessToken = issueAccessToken(
+				address,
+				accessJti
+			);
+
+			const { rawToken: refreshToken } =
+				await issueRefreshToken(address);
+
+			res.cookie(
+				ACCESS_TOKEN_COOKIE,
+				accessToken,
+				{
+					...COOKIE_BASE_OPTIONS,
+					maxAge:
+						ACCESS_TOKEN_TTL_SEC * 1000,
+				}
+			);
+
+			res.cookie(
+				REFRESH_TOKEN_COOKIE,
+				refreshToken,
+				{
+					...COOKIE_BASE_OPTIONS,
+					maxAge:
+						REFRESH_TOKEN_TTL_SEC * 1000,
+				}
+			);
+
+			return res.status(200).json({
+				access_token: accessToken,
+				refresh_token: refreshToken,
+				token_type: "Bearer",
+				expires_in: ACCESS_TOKEN_TTL_SEC,
+			});
+		} catch (error) {
+			console.error("[auth/verify]", error);
+
+			return res.status(500).json({
+				error: "Internal server error",
+			});
+		}
+	}
+);
+
+// ---------------------------------------------------------------------------
+// Route: POST /refresh
+// ---------------------------------------------------------------------------
+
+interface RefreshBody {
+	refresh_token?: string;
+}
+
+router.post(
+	"/refresh",
+	async (
+		req: Request<{}, {}, RefreshBody>,
+		res: Response
+	) => {
+		try {
+			const parsed =
+				RefreshRequestSchema.safeParse(req.body);
+
+			if (!parsed.success) {
+				return res.status(400).json({
+					error: "Invalid request body",
+				});
+			}
+
+			let refreshToken =
+				parsed.data.refresh_token;
+
+			if (!refreshToken) {
+				refreshToken =
+					req.cookies?.[
+						REFRESH_TOKEN_COOKIE
+					];
+			}
+
+			if (
+				!refreshToken ||
+				typeof refreshToken !== "string"
+			) {
+				return res.status(400).json({
+					error: "refresh_token is required",
+				});
+			}
+
+			const incomingHash = crypto
+				.createHash("sha256")
+				.update(refreshToken)
+				.digest("hex");
+
+			const record =
+				await prisma.refresh_tokens.findUnique({
+					where: {
+						token_hash: incomingHash,
+					},
+				});
+
+			if (!record) {
+				return res.status(401).json({
+					error: "Invalid refresh token",
+				});
+			}
+
+			if (record.revoked) {
+				console.warn(
+					`[auth/refresh] Revoked token replay attempt for ${record.address}`
+				);
+
+				return res.status(401).json({
+					error:
+						"Refresh token has been revoked",
+				});
+			}
+
+			if (
+				record.expires_at.getTime() <=
+				Date.now()
+			) {
+				return res.status(401).json({
+					error: "Refresh token expired",
+				});
+			}
+
+			const newAccessJti =
+				crypto.randomUUID();
+
+			const newAccessToken =
+				issueAccessToken(
+					record.address,
+					newAccessJti
+				);
+
+			const {
+				rawToken: newRefreshToken,
+			} = await issueRefreshToken(
+				record.address,
+				record.id
+			);
+
+			res.cookie(
+				ACCESS_TOKEN_COOKIE,
+				newAccessToken,
+				{
+					...COOKIE_BASE_OPTIONS,
+					maxAge:
+						ACCESS_TOKEN_TTL_SEC * 1000,
+				}
+			);
+
+			res.cookie(
+				REFRESH_TOKEN_COOKIE,
+				newRefreshToken,
+				{
+					...COOKIE_BASE_OPTIONS,
+					maxAge:
+						REFRESH_TOKEN_TTL_SEC * 1000,
+				}
+			);
+
+			return res.status(200).json({
+				access_token: newAccessToken,
+				refresh_token: newRefreshToken,
+				token_type: "Bearer",
+				expires_in: ACCESS_TOKEN_TTL_SEC,
+			});
+		} catch (error) {
+			console.error("[auth/refresh]", error);
+
+			return res.status(500).json({
+				error: "Internal server error",
+			});
+		}
+	}
+);
+
+// ---------------------------------------------------------------------------
+// Route: POST /logout
+// ---------------------------------------------------------------------------
+
+router.post(
+	"/logout",
+	async (req: Request, res: Response) => {
+		try {
+			let rawAccessToken =
+				req.cookies?.[
+					ACCESS_TOKEN_COOKIE
+				];
+
+			const authHeader =
+				req.headers.authorization;
+
+			if (
+				!rawAccessToken &&
+				authHeader?.startsWith("Bearer ")
+			) {
+				rawAccessToken =
+					authHeader.slice(7);
+			}
+
+			let refreshToken =
+				req.cookies?.[
+					REFRESH_TOKEN_COOKIE
+				];
+
+			const body =
+				req.body as RefreshBody;
+
+			if (
+				!refreshToken &&
+				body.refresh_token
+			) {
+				refreshToken =
+					body.refresh_token;
+			}
+
+			if (rawAccessToken) {
+				const secret =
+					process.env.JWT_SECRET;
+
+				if (secret) {
+					try {
+						const decoded = jwt.verify(
+							rawAccessToken,
+							secret,
+							{
+								issuer:
+									"lance-marketplace",
+								audience:
+									"lance-frontend",
+							}
+						) as JwtPayload;
+
+						if (
+							decoded.jti &&
+							decoded.exp
+						) {
+							await blacklistToken(
+								decoded.jti,
+								decoded.exp
+							);
+						}
+					} catch {
+						// Ignore invalid/expired token
+					}
+				}
+			}
+
+			if (
+				refreshToken &&
+				typeof refreshToken ===
+					"string"
+			) {
+				const hash = crypto
+					.createHash("sha256")
+					.update(refreshToken)
+					.digest("hex");
+
+				await prisma.refresh_tokens
+					.updateMany({
+						where: {
+							token_hash: hash,
+							revoked: false,
+						},
+						data: {
+							revoked: true,
+						},
+					})
+					.catch(() => {});
+			}
+
+			res.clearCookie(
+				ACCESS_TOKEN_COOKIE,
+				COOKIE_BASE_OPTIONS
+			);
+
+			res.clearCookie(
+				REFRESH_TOKEN_COOKIE,
+				COOKIE_BASE_OPTIONS
+			);
+
+			return res.status(200).json({
+				message: "Logged out successfully",
+			});
+		} catch (error) {
+			console.error("[auth/logout]", error);
+
+			return res.status(500).json({
+				error: "Internal server error",
+			});
+		}
+	}
+);
+
+// ---------------------------------------------------------------------------
+// Utility Exports
+// ---------------------------------------------------------------------------
+
+export { isTokenBlacklisted, blacklistToken };
 
 export default router;
